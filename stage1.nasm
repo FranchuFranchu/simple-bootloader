@@ -1,181 +1,35 @@
 ;**********************************************************************************;
-; Define Constants and Assembler Directive
+; Setup
 ;**********************************************************************************;
-%define STAGE1_ENTRY		0x7C00
-%define MBR_SIZE            0x200
-%define BLOCKBUFFER_SIZE	0x200
-%define	FIRST_PART_OFFSET	0x01BE
-;*************************************************;
-%define BLOCKBUFFER		STAGE1_ENTRY + MBR_SIZE
-%define FIRST_PARTITION		STAGE1_ENTRY + FIRST_PART_OFFSET
-%define KERNEL_ADDR		STAGE1_ENTRY + MBR_SIZE + BLOCKBUFFER_SIZE
-%define DFS_DATA_BEGIN		STAGE1_ENTRY + MBR_SIZE + 0x004
-%define DFS_DATA_END		STAGE1_ENTRY + MBR_SIZE + 0x1FB + 0x01
-%define DFS_NEXTBLOCK_0		STAGE1_ENTRY + MBR_SIZE + 0x1FC
-%define DFS_NEXTBLOCK_1		STAGE1_ENTRY + MBR_SIZE + 0x1FE
 
-org         STAGE1_ENTRY
-bits        16
+	;----------------------------------------------------
+    ; Constants
+	;----------------------------------------------------
+    %include    constants.nasm
+
+	;----------------------------------------------------
+    ; Assembler Directives
+	;----------------------------------------------------
+    org         STAGE1_ENTRY
+    bits        16
+    
 ;**********************************************************************************;
 
 ;**********************************************************************************;
 ; Begin Stage 1 
 ;**********************************************************************************;
 
-;*************************************************;
-; OEM Parameter block / BIOS Parameter Block
-;*************************************************;
-OEMLabel	    	db "FogsKink "	; Disk label
-BytesPerSector		dw 512		; Bytes per sector
-SectorsPerCluster	db 1		; Sectors per cluster
-ReservedForBoot		dw 1		; Reserved sectors for boot record
-NumberOfFATs		db 2		; Number of copies of the FAT
-RootDirEntries		dw 224		
-LogicalSectors		dw 2880		; Number of logical sectors
-MediumByte	    	db 0F0h		; Medium descriptor byte
-SectorsPerFAT		dw 9		; Sectors per FAT
-SectorsPerTrack		dw 18		; Sectors per track (36/cylinder)
-Sides		    	dw 2		; Number of sides/heads
-HiddenSectors		dd 0		; Number of hidden sectors
-LargeSectors		dd 0		; Number of LBA sectors
-DriveNo		    	db 0		; Drive No: 0
-Unused				db 0		; Unused sectors 
-Signature	    	db 29h		; Drive signature: 41 (0x29) for floppy
-VolumeID	    	dd 12345678h	; Volume ID: any number
-VolumeLabel	    	db "MY_FIRST_OS"; Volume Label: any 11 chars
-FileSystem	    	db "FAT12   "	; File system type: don't change!
+	;----------------------------------------------------
+    ; BIOS Parameter Block
+    ;----------------------------------------------------
+    %include    oemblock.nasm
 
 ;*************************************************;
 ; Jump to true start
 ;*************************************************;
 jmp         _start
 
-;*************************************************;
-; Print null-terminated string in 'si' register to screen
-;*************************************************;
-Print:
-	mov ah, 0Eh     ; Specify 'int 10h' 'teletype output' function
-	                ; [AL = Character, BH = Page Number, BL = Colour (in graphics mode)]
-.printchar:
-	lodsb           ; Load byte at address SI into AL, and increment SI
-	cmp al, 0
-	je .done        ; If the character is zero (NUL), stop writing the string
-	int 10h         ; Otherwise, print the character via 'int 10h'
-	jmp .printchar  ; Repeat for the next character
-.done:
-	ret
-
-;*************************************************;
-; Reset floppy disk
-;
-;INT 0x13/AH=0x0 - DISK : RESET DISK SYSTEM
-;AH = 0x0
-;DL = Drive to Reset
-;
-;Returns:
-;AH = Status Code
-;CF (Carry Flag) is clear if success, it is set if failure
-;*************************************************;
-reset:
-	mov		ah, 0					; reset floppy disk function
-	mov		dl, 0					; drive 0 is floppy drive
-	int		0x13					; call BIOS
-	jc		reset					; If Carry Flag (CF) is set, there was an error. Try resetting again
-	ret
-
-;************************************************;
-; Reads a series of sectors
-; CX=>Number of sectors to read
-; AX=>Starting sector
-; ES:BX=>Buffer to read to
-;
-; INT 0x13/AH=0x02 - DISK : READ SECTOR(S) INTO MEMORY
-; AH = 0x02
-; AL = Number of sectors to read
-; CH = Low eight bits of cylinder number
-; CL = Sector Number (Bits 0-5). Bits 6-7 are for hard disks only
-; DH = Head Number
-; DL = Drive Number (Bit 7 set for hard disks)
-; ES:BX = Buffer to read sectors to
-;
-; Returns:
-; AH = Status Code
-; AL = Number of sectors read
-; CF = set if failure, cleared is successfull
-;************************************************;
-
-ReadSectors:
-    .MAIN
-        mov     di, 0x0005                          ; five retries for error
-    .SECTORLOOP
-        push    ax
-        push    bx
-        push    cx
-        call    LBACHS                              ; convert starting sector to CHS
-        mov     ah, 0x02                            ; BIOS read sector
-        mov     al, 0x01                            ; read one sector
-        mov     ch, BYTE [absTrack]                 ; track
-        mov     cl, BYTE [absSector]                ; sector
-        mov     dh, BYTE [absHead]                  ; head
-        mov     dl, BYTE [bsDriveNumber]            ; drive
-        int     0x13                                ; invoke BIOS
-        jnc     .SUCCESS                            ; test for read error
-        xor     ax, ax                              ; BIOS reset disk
-        int     0x13                                ; invoke BIOS
-        dec     di                                  ; decrement error counter
-        pop     cx
-        pop     bx
-        pop     ax
-        jnz     .SECTORLOOP                         ; attempt to read again
-        int     0x18
-    .SUCCESS
-        mov     si, msgProgress
-        call    Print
-        pop     cx
-        pop     bx
-        pop     ax
-        add     bx, WORD [BytesPerSector]           ; queue next buffer
-        inc     ax                                  ; queue next sector
-        loop    .MAIN                               ; read next sector
-        ret
-
-;************************************************;
-; Convert CHS to LBA
-; AX=>Cluster start
-; AX -> LBA = (cluster - 2) * sectors per cluster
-;************************************************;
-ClusterLBA:
-    sub     ax, 0x0002                          ; zero base cluster number
-    xor     cx, cx
-    mov     cl, BYTE [SectorsPerCluster]		; convert byte to word
-    mul     cx
-    add     ax, WORD [datasector]               ; base data sector
-    ret
-
-;************************************************;
-; Convert LBA to CHS
-; AX=>LBA Address to convert
-;
-; absolute sector = (logical sector / sectors per track) + 1
-; absolute head   = (logical sector / sectors per track) % number of heads
-; absolute track  = logical sector / (sectors per track * number of heads)
-;
-;************************************************;
-LBACHS:
-	xor		dx, dx
-	; absSector = (LBA % SectorsPerTrack) + 1
-	;AX assumed to contain LBA
-	div		WORD [SectorsPerTrack]		; ax = LBA / SectorsPerTrack
-	inc		dl
-	mov		BYTE [absSector], dl
-	
-	; absHead = (LBA / SectorsPerTrack) % Sides
-	div		WORD [Sides]				; ax = (LBA / SectorsPerTrack) / Sides
-	mov		BYTE [absHead], dl
-	
-	; absTrack = LBA / (SectorsPerTrack * Sides)
-	mov		BYTE [absTrack], al
-	ret
+%include    helper.nasm
 
 ;*************************************************;
 ; Bootloader start
@@ -200,7 +54,6 @@ _start:
 	mov     ax, 0x0000				; set the stack
     mov     ss, ax
     mov     sp, 0xFFFF
-    
     sti								; restore interrupts
 	
 	;----------------------------------------------------
@@ -367,10 +220,4 @@ msgSuccess	db	"Success", 0x0D, 0x0A, 0
 msgFailure	db	"Error", 0x0D, 0x0A, 0
 msgProgress db  ".", 0x00
 
-;*************************************************;
-; Finish and pad
-;*************************************************;
-
-; Pad to 510 bytes (boot sector size minus 2) with 0s, and finish with the two-byte standard boot signature
-times 512-($-$$)-2  db 0 
-dw 0xAA55	        ; => 0x55 0xAA (little endian byte order)
+%include    pad.nasm
